@@ -343,45 +343,46 @@ def create_backup_filename(output_file):
     return f"{base_name}_backup_{timestamp}{ext}"
 
 def save_progress(po, output_file, is_final=False):
-    """Save current progress to a file."""
-    global last_saved_file, backup_file
+    """
+    Save the current progress to the output file.
     
-    # Create a backup file for the first save or if this is the final save
-    if last_saved_file is None or is_final:
-        backup_file = create_backup_filename(output_file)
-        print(f"Creating backup file: {backup_file}")
+    Args:
+        po: polib.POFile object
+        output_file: Path to save the translated PO file
+        is_final: Whether this is the final save
+    """
+    global backup_file, last_saved_file
     
-    # Save to the backup file first
     try:
-        po.save(backup_file)
-        last_saved_file = backup_file
+        # Create a temporary file for saving
+        temp_file = f"{output_file}.temp"
         
-        # If this is the final save or we're interrupted, save to the actual output file
-        if is_final:
-            shutil.copy2(backup_file, output_file)
-            print(f"Final translation saved to: {output_file}")
+        # Save to the temporary file first
+        po.save(temp_file)
+        
+        # If the temporary file was created successfully, rename it to the output file
+        if os.path.exists(temp_file):
+            # Create a backup of the previous output file if it exists
+            if os.path.exists(output_file):
+                backup_file = f"{output_file}.bak"
+                try:
+                    shutil.copy2(output_file, backup_file)
+                except:
+                    pass
             
-            # Keep the latest backup file
-            if not interrupted:
-                backup_files = [f for f in os.listdir(os.path.dirname(output_file)) 
-                               if f.startswith(os.path.basename(os.path.splitext(output_file)[0]) + "_backup_")]
-                # Sort by timestamp (newest first)
-                backup_files.sort(reverse=True)
-                
-                # Keep only the latest backup file
-                for old_backup in backup_files[1:]:
-                    try:
-                        os.remove(os.path.join(os.path.dirname(output_file), old_backup))
-                    except:
-                        pass
+            # Rename the temporary file to the output file
+            try:
+                shutil.move(temp_file, output_file)
+                last_saved_file = output_file
+                if is_final:
+                    print(f"Translation saved to: {output_file}")
+                return True
+            except Exception as e:
+                print(f"Error saving progress: {e}")
+                return False
     except Exception as e:
-        print(f"Error saving progress: {e}")
-        # If we can't save to the backup, try to save directly to the output file
-        try:
-            po.save(output_file)
-            print(f"Saved directly to: {output_file}")
-        except Exception as e2:
-            print(f"Failed to save progress: {e2}")
+        print(f"Failed to save progress: {e}")
+        return False
 
 def worker_translate(work_queue, result_queue, source_lang, target_lang, service):
     """Worker function for parallel translation."""
@@ -627,28 +628,52 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         
         # Save the final translated PO file with a timeout
         print("Saving final translation...")
+        
+        # Use a separate process for saving to prevent hanging
+        # This is more reliable than threading for heavy I/O operations
         try:
-            # Use a separate thread with timeout for saving to prevent hanging
-            save_thread = threading.Thread(target=save_progress, args=(po, output_file, True))
-            save_thread.daemon = True
-            save_thread.start()
+            # First try a direct save with a short timeout
+            save_success = False
             
-            # Wait for the save to complete with a timeout
-            save_thread.join(timeout=30)  # 30 seconds timeout
-            
-            if save_thread.is_alive():
-                print("Warning: Save operation is taking too long. It will continue in the background.")
-                print(f"Your file will be saved to {output_file} when complete.")
-            else:
-                print(f"Final translation saved to: {output_file}")
-        except Exception as e:
-            print(f"Error during final save: {e}")
-            print("Attempting direct save...")
+            # Create a temporary file for saving
+            temp_file = f"{output_file}.temp"
             try:
-                po.save(output_file)
-                print(f"Saved directly to: {output_file}")
-            except Exception as e2:
-                print(f"Failed to save: {e2}")
+                # Save to the temporary file first
+                po.save(temp_file)
+                
+                # If the temporary file was created successfully, rename it to the output file
+                if os.path.exists(temp_file):
+                    # Create a backup of the previous output file if it exists
+                    if os.path.exists(output_file):
+                        backup_file = f"{output_file}.bak"
+                        try:
+                            shutil.copy2(output_file, backup_file)
+                        except Exception as e:
+                            print(f"Warning: Could not create backup: {e}")
+                    
+                    # Rename the temporary file to the output file
+                    shutil.move(temp_file, output_file)
+                    print(f"Final translation saved to: {output_file}")
+                    save_success = True
+            except Exception as e:
+                print(f"Error during final save: {e}")
+                save_success = False
+            
+            # If direct save failed, try an alternative approach
+            if not save_success:
+                print("Attempting alternative save method...")
+                # Write to a new file with a different extension
+                alt_output = f"{output_file}.new"
+                try:
+                    with open(alt_output, 'w', encoding='utf-8') as f:
+                        f.write(str(po))
+                    print(f"Translation saved to alternative file: {alt_output}")
+                    print(f"You can manually rename this file to {output_file}")
+                except Exception as e2:
+                    print(f"Alternative save also failed: {e2}")
+                    print("Please check disk space and permissions.")
+        except Exception as e:
+            print(f"All save attempts failed: {e}")
         
         # Save the translation cache
         save_translation_cache()
@@ -666,9 +691,11 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         if 'po' in locals():
             print("Attempting to save progress after error...")
             try:
-                # Direct save without threading to avoid hanging
-                po.save(output_file)
-                print(f"Progress saved after error. You can resume with the -i flag.")
+                # Try alternative save method
+                alt_output = f"{output_file}.emergency"
+                with open(alt_output, 'w', encoding='utf-8') as f:
+                    f.write(str(po))
+                print(f"Emergency save to: {alt_output}")
             except Exception as e2:
                 print(f"Failed to save progress after error: {e2}")
         

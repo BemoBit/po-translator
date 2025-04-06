@@ -1,0 +1,42 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Backup and temporary files
+*~
+*.bak
+*.tmp
+*_backup_*
+
+# Translation service API keys or credentials
+*.key
+*.secret
+credentials.json
+
+# Log files
+*.log
+
+# Test files
+test_*.po

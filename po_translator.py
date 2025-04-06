@@ -125,31 +125,23 @@ def detect_language_from_po(po_file):
                 sample_texts.append(entry.msgid)
         
         if sample_texts:
-            # Try to detect language using Google Translate
-            try:
-                from googletrans import Translator
-                translator = Translator()
-                detection = translator.detect(sample_texts[0])
-                if detection and detection.lang:
-                    return detection.lang
-            except:
-                # If googletrans fails, fallback to simple heuristics
-                text = " ".join(sample_texts)
-                
-                # Check for common language patterns
-                if re.search(r'[а-яА-Я]', text):  # Cyrillic characters
-                    return 'ru'  # Russian
-                elif re.search(r'[ا-ي]', text):  # Arabic characters
-                    return 'ar'  # Arabic
-                elif re.search(r'[一-龯]', text):  # Chinese characters
-                    return 'zh'  # Chinese
-                elif re.search(r'[あ-んア-ン]', text):  # Japanese characters
-                    return 'ja'  # Japanese
-                elif re.search(r'[가-힣]', text):  # Korean characters
-                    return 'ko'  # Korean
-                else:
-                    # Default to English for Latin script
-                    return 'en'
+            # Simple language detection based on character sets
+            text = " ".join(sample_texts)
+            
+            # Check for common language patterns
+            if re.search(r'[а-яА-Я]', text):  # Cyrillic characters
+                return 'ru'  # Russian
+            elif re.search(r'[ا-ي]', text):  # Arabic characters
+                return 'ar'  # Arabic
+            elif re.search(r'[一-龯]', text):  # Chinese characters
+                return 'zh'  # Chinese
+            elif re.search(r'[あ-んア-ン]', text):  # Japanese characters
+                return 'ja'  # Japanese
+            elif re.search(r'[가-힣]', text):  # Korean characters
+                return 'ko'  # Korean
+            else:
+                # Default to English for Latin script
+                return 'en'
     
     # If all detection methods fail, return 'auto'
     return 'auto'
@@ -227,24 +219,32 @@ def translate_with_google(text, source_lang="auto", target_lang="fa"):
     if not text or text.isspace():
         return text
         
+    # Add a small delay to avoid hitting API rate limits
+    time.sleep(0.2)
+    
+    # Use direct HTTP request to Google Translate API
     try:
-        # Try to import googletrans if available
-        from googletrans import Translator
-        translator = Translator()
-        result = translator.translate(text, dest=target_lang, src=source_lang)
-        return result.text
-    except ImportError:
-        # Fallback to a simple HTTP request to Google Translate
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={urllib.parse.quote(text)}"
+        request = urllib.request.Request(url, headers={'User-Agent': user_agent})
+        response = urllib.request.urlopen(request)
+        data = json.loads(response.read().decode('utf-8'))
+        translated_text = ''.join([sentence[0] for sentence in data[0]])
+        return translated_text
+    except Exception as e:
+        print(f"Google Translate API error: {e}")
+        # If the direct API call fails, try an alternative approach
         try:
-            user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q={urllib.parse.quote(text)}"
+            # Alternative API endpoint
+            url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl={source_lang}&tl={target_lang}&q={urllib.parse.quote(text)}"
             request = urllib.request.Request(url, headers={'User-Agent': user_agent})
             response = urllib.request.urlopen(request)
             data = json.loads(response.read().decode('utf-8'))
-            translated_text = ''.join([sentence[0] for sentence in data[0]])
-            return translated_text
-        except Exception as e:
-            print(f"Google Translate API error: {e}")
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]
+            return text
+        except Exception as e2:
+            print(f"Alternative Google Translate API error: {e2}")
             return text
 
 @lru_cache(maxsize=1000)

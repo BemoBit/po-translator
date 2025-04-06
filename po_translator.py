@@ -560,6 +560,9 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
                     po[i].msgstr = batch_results.get(entry_id, '')
                 elif entry_id.startswith('msgstr_plural_'):
                     plural_index = entry_id.split('_')[-1]
+                    # Convert plural_index to the same type as used in the PO file
+                    if isinstance(next(iter(po[i].msgstr_plural.keys()), '0'), int):
+                        plural_index = int(plural_index)
                     po[i].msgstr_plural[plural_index] = batch_results.get(entry_id, '')
             
             translated_count += len(current_batch)

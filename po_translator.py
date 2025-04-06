@@ -74,6 +74,7 @@ interrupted = False
 last_saved_file = None
 backup_file = None
 save_interval = 50  # Save after every 50 translations
+worker_threads = []  # Keep track of worker threads
 
 # Translation cache to avoid redundant API calls
 translation_cache = {}
@@ -88,6 +89,14 @@ def signal_handler(sig, frame):
     global interrupted
     print("\nInterrupt received. Saving progress before exiting...")
     interrupted = True
+    
+    # Terminate any running worker threads
+    for thread in worker_threads:
+        if thread.is_alive():
+            # We can't forcibly terminate threads in Python, but we can set a flag
+            # The threads should check the interrupted flag regularly
+            pass  # The threads will check the global interrupted flag
+    
     # The actual save will happen in the main loop
 
 def detect_language_from_po(po_file):
@@ -376,15 +385,26 @@ def save_progress(po, output_file, is_final=False):
 
 def worker_translate(work_queue, result_queue, source_lang, target_lang, service):
     """Worker function for parallel translation."""
-    while True:
+    global interrupted
+    while not interrupted:
         try:
-            # Get a task from the queue
-            task = work_queue.get(block=False)
+            # Get a task from the queue with a timeout
+            try:
+                task = work_queue.get(block=True, timeout=0.5)
+            except queue.Empty:
+                # No more tasks or timeout
+                continue
+                
             if task is None:  # Sentinel value to indicate end of queue
                 work_queue.task_done()
                 break
                 
             index, entry_id, text = task
+            
+            # Check if we've been interrupted
+            if interrupted:
+                work_queue.task_done()
+                break
             
             # Translate the text
             translated = translate_text(text, source_lang, target_lang, service)
@@ -401,7 +421,8 @@ def worker_translate(work_queue, result_queue, source_lang, target_lang, service
         except Exception as e:
             print(f"Error in worker: {e}")
             # Mark the task as done even if it failed
-            work_queue.task_done()
+            if 'task' in locals() and task is not None:
+                work_queue.task_done()
 
 def batch_translate(texts, source_lang, target_lang, service, num_workers=MAX_WORKERS):
     """
@@ -417,6 +438,12 @@ def batch_translate(texts, source_lang, target_lang, service, num_workers=MAX_WO
     Returns:
         Dictionary mapping entry_id to translated text
     """
+    global worker_threads, interrupted
+    
+    # If interrupted, don't start new translations
+    if interrupted:
+        return {}
+    
     # Create queues for work and results
     work_queue = queue.Queue()
     result_queue = queue.Queue()
@@ -430,7 +457,7 @@ def batch_translate(texts, source_lang, target_lang, service, num_workers=MAX_WO
         work_queue.put(None)
     
     # Create and start worker threads
-    threads = []
+    worker_threads = []
     for _ in range(min(num_workers, len(texts))):
         thread = threading.Thread(
             target=worker_translate,
@@ -438,10 +465,20 @@ def batch_translate(texts, source_lang, target_lang, service, num_workers=MAX_WO
         )
         thread.daemon = True
         thread.start()
-        threads.append(thread)
+        worker_threads.append(thread)
     
-    # Wait for all tasks to be processed
-    work_queue.join()
+    # Wait for all tasks to be processed or interrupted
+    try:
+        # Use a timeout to allow checking for interruption
+        while not work_queue.empty() and not interrupted:
+            time.sleep(0.1)
+            
+        # If we're interrupted, don't wait for the queue to be empty
+        if not interrupted:
+            work_queue.join()
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupt received during batch translation")
     
     # Get results
     results = {}
@@ -468,7 +505,7 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         source_lang: Source language code (if None, will be auto-detected)
         num_workers: Number of worker threads/processes for parallel translation
     """
-    global interrupted, backup_file
+    global interrupted, backup_file, worker_threads
     
     try:
         # Set up signal handlers for graceful interruption
@@ -540,6 +577,7 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         # Process in optimized batches
         for batch_start in range(0, total_to_translate, batch_size):
             if interrupted:
+                print("Translation interrupted. Saving progress...")
                 break
                 
             # Get the current batch
@@ -553,6 +591,11 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
                 service,
                 num_workers
             )
+            
+            # If we were interrupted during batch translation, break the loop
+            if interrupted:
+                print("Batch translation interrupted. Saving progress...")
+                break
             
             # Update the PO file with translations
             for i, entry_id, _ in current_batch:
@@ -582,8 +625,30 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         if use_tqdm:
             progress_bar.close()
         
-        # Save the final translated PO file
-        save_progress(po, output_file, is_final=True)
+        # Save the final translated PO file with a timeout
+        print("Saving final translation...")
+        try:
+            # Use a separate thread with timeout for saving to prevent hanging
+            save_thread = threading.Thread(target=save_progress, args=(po, output_file, True))
+            save_thread.daemon = True
+            save_thread.start()
+            
+            # Wait for the save to complete with a timeout
+            save_thread.join(timeout=30)  # 30 seconds timeout
+            
+            if save_thread.is_alive():
+                print("Warning: Save operation is taking too long. It will continue in the background.")
+                print(f"Your file will be saved to {output_file} when complete.")
+            else:
+                print(f"Final translation saved to: {output_file}")
+        except Exception as e:
+            print(f"Error during final save: {e}")
+            print("Attempting direct save...")
+            try:
+                po.save(output_file)
+                print(f"Saved directly to: {output_file}")
+            except Exception as e2:
+                print(f"Failed to save: {e2}")
         
         # Save the translation cache
         save_translation_cache()
@@ -592,7 +657,7 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
             print(f"Interrupted! Translated {translated_count}/{total_to_translate} entries before interruption.")
             print(f"You can resume by running the script again with the -i flag to keep existing translations.")
         else:
-            print(f"Translation completed. Translated {translated_count} entries. Saved to {output_file}")
+            print(f"Translation completed. Translated {translated_count} entries.")
         
     except Exception as e:
         print(f"Error: {e}")
@@ -601,10 +666,11 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         if 'po' in locals():
             print("Attempting to save progress after error...")
             try:
-                save_progress(po, output_file, is_final=True)
+                # Direct save without threading to avoid hanging
+                po.save(output_file)
                 print(f"Progress saved after error. You can resume with the -i flag.")
-            except:
-                print("Failed to save progress after error.")
+            except Exception as e2:
+                print(f"Failed to save progress after error: {e2}")
         
         # Save the translation cache
         if 'translation_cache' in globals() and translation_cache:

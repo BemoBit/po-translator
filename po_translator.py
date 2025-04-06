@@ -195,10 +195,22 @@ def save_translation_cache():
             print(f"Error saving translation cache: {e}")
 
 def get_cache_key(text, source_lang, target_lang):
-    """Generate a unique cache key for a translation request."""
-    # Use a hash of the text to avoid issues with special characters in filenames
+    """
+    Generate a unique cache key for a translation.
+    
+    Args:
+        text: Text to translate
+        source_lang: Source language code
+        target_lang: Target language code
+        
+    Returns:
+        str: Cache key
+    """
+    # Include a prefix to avoid collisions with other keys
+    # Include source and target languages in the key
+    # Use a hash of the text to avoid issues with special characters
     text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-    return f"{source_lang}_{target_lang}_{text_hash}"
+    return f"tr_{source_lang}_{target_lang}_{text_hash}"
 
 def get_cached_translation(text, source_lang, target_lang):
     """Get a translation from the cache if it exists."""
@@ -238,23 +250,55 @@ def translate_with_google(text, source_lang="auto", target_lang="fa"):
         request = urllib.request.Request(url, headers={'User-Agent': user_agent})
         response = urllib.request.urlopen(request)
         data = json.loads(response.read().decode('utf-8'))
-        translated_text = ''.join([sentence[0] for sentence in data[0]])
+        
+        # Ensure we're getting a valid translation
+        if not data or not data[0]:
+            print(f"Warning: Empty translation data for text: {text[:50]}...")
+            return text
+            
+        translated_text = ''.join([sentence[0] for sentence in data[0] if sentence and len(sentence) > 0])
+        
+        # Verify the translation is not empty and is different from the source
+        if not translated_text or translated_text.isspace():
+            print(f"Warning: Empty translation result for text: {text[:50]}...")
+            return text
+            
+        # If the translation is suspiciously short compared to the original,
+        # it might be an error or truncation
+        if len(translated_text) < len(text) * 0.3 and len(text) > 20:
+            print(f"Warning: Translation seems too short: '{translated_text}' for text: {text[:50]}...")
+            # Try again with a different approach or return the original
+            return translate_with_google_alternative(text, source_lang, target_lang)
+            
         return translated_text
     except Exception as e:
         print(f"Google Translate API error: {e}")
         # If the direct API call fails, try an alternative approach
-        try:
-            # Alternative API endpoint
-            url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl={source_lang}&tl={target_lang}&q={urllib.parse.quote(text)}"
-            request = urllib.request.Request(url, headers={'User-Agent': user_agent})
-            response = urllib.request.urlopen(request)
-            data = json.loads(response.read().decode('utf-8'))
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-            return text
-        except Exception as e2:
-            print(f"Alternative Google Translate API error: {e2}")
-            return text
+        return translate_with_google_alternative(text, source_lang, target_lang)
+
+def translate_with_google_alternative(text, source_lang="auto", target_lang="fa"):
+    """Alternative method for Google translation when the primary method fails."""
+    try:
+        # Alternative API endpoint
+        user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        url = f"https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl={source_lang}&tl={target_lang}&q={urllib.parse.quote(text)}"
+        request = urllib.request.Request(url, headers={'User-Agent': user_agent})
+        response = urllib.request.urlopen(request)
+        data = json.loads(response.read().decode('utf-8'))
+        
+        if isinstance(data, list) and len(data) > 0:
+            result = data[0]
+            
+            # Verify the translation is reasonable
+            if result and len(result) >= len(text) * 0.3:
+                return result
+                
+        # If we get here, the alternative also failed or returned suspicious results
+        print(f"Warning: Alternative translation also failed for: {text[:50]}...")
+        return text
+    except Exception as e2:
+        print(f"Alternative Google Translate API error: {e2}")
+        return text
 
 @lru_cache(maxsize=1000)
 def translate_with_libretranslate(text, source_lang="auto", target_lang="fa", api_url="https://libretranslate.com/translate"):
@@ -407,8 +451,40 @@ def worker_translate(work_queue, result_queue, source_lang, target_lang, service
                 work_queue.task_done()
                 break
             
+            # Check if this is a format string with placeholders
+            has_placeholders = '%' in text and any(c.isalpha() for c in text.split('%')[1:])
+            
             # Translate the text
-            translated = translate_text(text, source_lang, target_lang, service)
+            if has_placeholders:
+                # For strings with format placeholders, we need to be more careful
+                # Extract the placeholders and translate only the text parts
+                placeholders = re.findall(r'%[0-9]*(?:\.[0-9]+)?[a-zA-Z]', text)
+                parts = re.split(r'(%[0-9]*(?:\.[0-9]+)?[a-zA-Z])', text)
+                
+                # Translate the text parts only
+                translated_parts = []
+                for i, part in enumerate(parts):
+                    if i % 2 == 0:  # Even indices are text parts
+                        if part.strip():  # Only translate non-empty parts
+                            translated_parts.append(translate_text(part, source_lang, target_lang, service))
+                        else:
+                            translated_parts.append(part)
+                    else:  # Odd indices are placeholders
+                        translated_parts.append(part)
+                
+                # Reassemble the translated string with placeholders
+                translated = ''.join(translated_parts)
+                
+                # Verify all placeholders are still present
+                for placeholder in placeholders:
+                    if placeholder not in translated:
+                        print(f"Warning: Placeholder {placeholder} missing in translation. Fixing...")
+                        # If a placeholder is missing, fall back to a simpler approach
+                        translated = translate_text(text, source_lang, target_lang, service)
+                        break
+            else:
+                # Normal translation for strings without placeholders
+                translated = translate_text(text, source_lang, target_lang, service)
             
             # Put the result in the result queue
             result_queue.put((index, entry_id, translated))

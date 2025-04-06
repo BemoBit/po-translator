@@ -20,6 +20,11 @@ import signal
 import datetime
 import shutil
 import re
+import threading
+import queue
+import hashlib
+import concurrent.futures
+from functools import lru_cache
 
 # Try to import optional dependencies
 try:
@@ -69,6 +74,14 @@ interrupted = False
 last_saved_file = None
 backup_file = None
 save_interval = 50  # Save after every 50 translations
+
+# Translation cache to avoid redundant API calls
+translation_cache = {}
+translation_cache_file = None
+cache_lock = threading.Lock()
+
+# Maximum number of worker threads/processes
+MAX_WORKERS = 5
 
 def signal_handler(sig, frame):
     """Handle interrupt signals to save progress before exiting."""
@@ -145,8 +158,75 @@ def get_language_name(lang_code):
     """Get the language name from its code."""
     return LANGUAGE_CODES.get(lang_code, lang_code)
 
+def load_translation_cache(input_file, target_lang):
+    """Load the translation cache from file if it exists."""
+    global translation_cache, translation_cache_file
+    
+    # Create a cache filename based on the input file and target language
+    base_name = os.path.basename(input_file)
+    cache_dir = os.path.join(os.path.dirname(input_file), '.cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    cache_filename = f"{base_name}_{target_lang}_cache.json"
+    translation_cache_file = os.path.join(cache_dir, cache_filename)
+    
+    if os.path.exists(translation_cache_file):
+        try:
+            with open(translation_cache_file, 'r', encoding='utf-8') as f:
+                translation_cache = json.load(f)
+            print(f"Loaded {len(translation_cache)} cached translations")
+        except Exception as e:
+            print(f"Error loading translation cache: {e}")
+            translation_cache = {}
+    else:
+        translation_cache = {}
+
+def save_translation_cache():
+    """Save the translation cache to file."""
+    global translation_cache, translation_cache_file
+    
+    if translation_cache_file and translation_cache:
+        try:
+            with cache_lock:
+                with open(translation_cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(translation_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Error saving translation cache: {e}")
+
+def get_cache_key(text, source_lang, target_lang):
+    """Generate a unique cache key for a translation request."""
+    # Use a hash of the text to avoid issues with special characters in filenames
+    text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
+    return f"{source_lang}_{target_lang}_{text_hash}"
+
+def get_cached_translation(text, source_lang, target_lang):
+    """Get a translation from the cache if it exists."""
+    if not text or text.isspace():
+        return text
+    
+    cache_key = get_cache_key(text, source_lang, target_lang)
+    with cache_lock:
+        return translation_cache.get(cache_key)
+
+def cache_translation(text, translated_text, source_lang, target_lang):
+    """Cache a translation for future use."""
+    if not text or text.isspace() or not translated_text:
+        return
+    
+    cache_key = get_cache_key(text, source_lang, target_lang)
+    with cache_lock:
+        translation_cache[cache_key] = translated_text
+    
+    # Periodically save the cache to disk
+    if len(translation_cache) % 100 == 0:
+        save_translation_cache()
+
+@lru_cache(maxsize=1000)
 def translate_with_google(text, source_lang="auto", target_lang="fa"):
     """Translate text using Google Translate API (no API key required)."""
+    if not text or text.isspace():
+        return text
+        
     try:
         # Try to import googletrans if available
         from googletrans import Translator
@@ -167,8 +247,12 @@ def translate_with_google(text, source_lang="auto", target_lang="fa"):
             print(f"Google Translate API error: {e}")
             return text
 
+@lru_cache(maxsize=1000)
 def translate_with_libretranslate(text, source_lang="auto", target_lang="fa", api_url="https://libretranslate.com/translate"):
     """Translate text using LibreTranslate API."""
+    if not text or text.isspace():
+        return text
+        
     try:
         data = {
             "q": text,
@@ -186,8 +270,12 @@ def translate_with_libretranslate(text, source_lang="auto", target_lang="fa", ap
         print(f"LibreTranslate API error: {e}")
         return text
 
+@lru_cache(maxsize=1000)
 def translate_with_mymemory(text, source_lang="en", target_lang="fa", email=None):
     """Translate text using MyMemory API (free, up to 5000 words/day)."""
+    if not text or text.isspace():
+        return text
+        
     try:
         # MyMemory doesn't support 'auto' as source language
         if source_lang == "auto":
@@ -211,22 +299,33 @@ def translate_with_mymemory(text, source_lang="en", target_lang="fa", email=None
         return text
 
 def translate_text(text, source_lang="auto", target_lang="fa", service=TRANSLATION_SERVICE):
-    """Translate text using the specified translation service."""
+    """Translate text using the specified translation service with caching."""
     if not text or text.isspace():
         return text
     
-    # Add a small delay to avoid hitting API rate limits
-    time.sleep(0.5)
+    # Check if we have this translation in cache
+    cached = get_cached_translation(text, source_lang, target_lang)
+    if cached:
+        return cached
     
+    # Add a small delay to avoid hitting API rate limits
+    time.sleep(0.2)  # Reduced from 0.5 to 0.2 seconds
+    
+    # Translate using the selected service
     if service == "google":
-        return translate_with_google(text, source_lang, target_lang)
+        result = translate_with_google(text, source_lang, target_lang)
     elif service == "libretranslate":
-        return translate_with_libretranslate(text, source_lang, target_lang)
+        result = translate_with_libretranslate(text, source_lang, target_lang)
     elif service == "mymemory":
-        return translate_with_mymemory(text, source_lang, target_lang)
+        result = translate_with_mymemory(text, source_lang, target_lang)
     else:
         print(f"Unknown translation service: {service}")
-        return text
+        result = text
+    
+    # Cache the result
+    cache_translation(text, result, source_lang, target_lang)
+    
+    return result
 
 def create_backup_filename(output_file):
     """Create a backup filename with timestamp."""
@@ -275,9 +374,86 @@ def save_progress(po, output_file, is_final=False):
         except Exception as e2:
             print(f"Failed to save progress: {e2}")
 
+def worker_translate(work_queue, result_queue, source_lang, target_lang, service):
+    """Worker function for parallel translation."""
+    while True:
+        try:
+            # Get a task from the queue
+            task = work_queue.get(block=False)
+            if task is None:  # Sentinel value to indicate end of queue
+                work_queue.task_done()
+                break
+                
+            index, entry_id, text = task
+            
+            # Translate the text
+            translated = translate_text(text, source_lang, target_lang, service)
+            
+            # Put the result in the result queue
+            result_queue.put((index, entry_id, translated))
+            
+            # Mark the task as done
+            work_queue.task_done()
+            
+        except queue.Empty:
+            # No more tasks
+            break
+        except Exception as e:
+            print(f"Error in worker: {e}")
+            # Mark the task as done even if it failed
+            work_queue.task_done()
+
+def batch_translate(texts, source_lang, target_lang, service, num_workers=MAX_WORKERS):
+    """
+    Translate a batch of texts in parallel.
+    
+    Args:
+        texts: List of (index, entry_id, text) tuples
+        source_lang: Source language code
+        target_lang: Target language code
+        service: Translation service to use
+        num_workers: Number of worker threads
+        
+    Returns:
+        Dictionary mapping entry_id to translated text
+    """
+    # Create queues for work and results
+    work_queue = queue.Queue()
+    result_queue = queue.Queue()
+    
+    # Add tasks to the work queue
+    for item in texts:
+        work_queue.put(item)
+    
+    # Add sentinel values to indicate end of queue
+    for _ in range(num_workers):
+        work_queue.put(None)
+    
+    # Create and start worker threads
+    threads = []
+    for _ in range(min(num_workers, len(texts))):
+        thread = threading.Thread(
+            target=worker_translate,
+            args=(work_queue, result_queue, source_lang, target_lang, service)
+        )
+        thread.daemon = True
+        thread.start()
+        threads.append(thread)
+    
+    # Wait for all tasks to be processed
+    work_queue.join()
+    
+    # Get results
+    results = {}
+    while not result_queue.empty():
+        index, entry_id, translated = result_queue.get()
+        results[entry_id] = translated
+    
+    return results
+
 def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATION_SERVICE, 
                      ignore_translated=False, save_interval=50, target_lang=DEFAULT_TARGET_LANG,
-                     source_lang=None):
+                     source_lang=None, num_workers=MAX_WORKERS):
     """
     Translate a PO file to the target language.
     
@@ -290,6 +466,7 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         save_interval: Save progress after this many translations
         target_lang: Target language code
         source_lang: Source language code (if None, will be auto-detected)
+        num_workers: Number of worker threads/processes for parallel translation
     """
     global interrupted, backup_file
     
@@ -311,33 +488,41 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         print(f"Source language detected: {source_lang} ({get_language_name(source_lang)})")
         print(f"Target language: {target_lang} ({get_language_name(target_lang)})")
         print(f"Using translation service: {service}")
+        print(f"Using {num_workers} worker threads for parallel translation")
+        
+        # Load translation cache
+        load_translation_cache(input_file, target_lang)
         
         if ignore_translated:
             print("Ignoring already translated entries (keeping existing translations)")
         
         # Count entries that need translation
-        entries_to_translate = 0
-        for entry in po:
+        entries_to_translate = []
+        for i, entry in enumerate(po):
             if entry.msgid and not entry.obsolete:
                 if not entry.msgstr and not ignore_translated:
-                    entries_to_translate += 1
+                    entries_to_translate.append((i, 'msgstr', entry.msgid))
                 elif not entry.msgstr and ignore_translated:
-                    entries_to_translate += 1
+                    entries_to_translate.append((i, 'msgstr', entry.msgid))
                 
                 # Count plural forms that need translation
                 if entry.msgid_plural and entry.msgstr_plural:
                     for plural_index in entry.msgstr_plural:
                         if not entry.msgstr_plural[plural_index] and not ignore_translated:
-                            entries_to_translate += 1
+                            plural_text = entry.msgid_plural if plural_index != '0' else entry.msgid
+                            entries_to_translate.append((i, f'msgstr_plural_{plural_index}', plural_text))
                         elif not entry.msgstr_plural[plural_index] and ignore_translated:
-                            entries_to_translate += 1
+                            plural_text = entry.msgid_plural if plural_index != '0' else entry.msgid
+                            entries_to_translate.append((i, f'msgstr_plural_{plural_index}', plural_text))
         
-        if entries_to_translate == 0:
+        total_to_translate = len(entries_to_translate)
+        
+        if total_to_translate == 0:
             print("No entries need translation. Saving file as is.")
             po.save(output_file)
             return
         
-        print(f"Found {entries_to_translate} entries that need translation")
+        print(f"Found {total_to_translate} entries that need translation")
         print(f"Progress will be saved every {save_interval} translations")
         
         # Update the metadata to reflect the new language
@@ -346,57 +531,65 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
         
         # Process entries in batches with progress bar if tqdm is available
         if use_tqdm:
-            iterator = tqdm(range(0, total_entries, batch_size), desc="Translating")
+            progress_bar = tqdm(total=total_to_translate, desc="Translating")
         else:
-            iterator = range(0, total_entries, batch_size)
             print("Starting translation...")
         
         translated_count = 0
-        for i in iterator:
-            batch = po[i:i+batch_size]
-            
-            for entry in batch:
-                if interrupted:
-                    print("Interrupted! Saving progress...")
-                    save_progress(po, output_file, is_final=True)
-                    print(f"Translated {translated_count}/{entries_to_translate} entries before interruption.")
-                    print(f"You can resume by running the script again with the -i flag to keep existing translations.")
-                    return
+        
+        # Process in optimized batches
+        for batch_start in range(0, total_to_translate, batch_size):
+            if interrupted:
+                break
                 
-                if entry.msgid and not entry.obsolete:
-                    # Translate msgstr if it's empty or if we're not ignoring already translated entries
-                    if not entry.msgstr:
-                        entry.msgstr = translate_text(entry.msgid, source_lang, target_lang, service)
-                        translated_count += 1
-                    elif not ignore_translated:
-                        entry.msgstr = translate_text(entry.msgid, source_lang, target_lang, service)
-                        translated_count += 1
-                    
-                    # Handle plural forms if they exist
-                    if entry.msgid_plural and entry.msgstr_plural:
-                        for plural_index in entry.msgstr_plural:
-                            if not entry.msgstr_plural[plural_index]:
-                                plural_text = entry.msgid_plural if plural_index != '0' else entry.msgid
-                                entry.msgstr_plural[plural_index] = translate_text(plural_text, source_lang, target_lang, service)
-                                translated_count += 1
-                            elif not ignore_translated:
-                                plural_text = entry.msgid_plural if plural_index != '0' else entry.msgid
-                                entry.msgstr_plural[plural_index] = translate_text(plural_text, source_lang, target_lang, service)
-                                translated_count += 1
+            # Get the current batch
+            current_batch = entries_to_translate[batch_start:batch_start + batch_size]
             
-            # Print progress if tqdm is not available
-            if not use_tqdm and (i + batch_size) % (batch_size * 10) == 0:
-                progress = min(100, int((i + batch_size) / total_entries * 100))
-                print(f"Progress: {progress}% ({i + batch_size}/{total_entries})")
+            # Translate the batch in parallel
+            batch_results = batch_translate(
+                current_batch, 
+                source_lang, 
+                target_lang, 
+                service,
+                num_workers
+            )
+            
+            # Update the PO file with translations
+            for i, entry_id, _ in current_batch:
+                if entry_id == 'msgstr':
+                    po[i].msgstr = batch_results.get(entry_id, '')
+                elif entry_id.startswith('msgstr_plural_'):
+                    plural_index = entry_id.split('_')[-1]
+                    po[i].msgstr_plural[plural_index] = batch_results.get(entry_id, '')
+            
+            translated_count += len(current_batch)
+            
+            # Update progress bar
+            if use_tqdm:
+                progress_bar.update(len(current_batch))
+            elif translated_count % (batch_size * 5) == 0 or translated_count == total_to_translate:
+                progress = min(100, int(translated_count / total_to_translate * 100))
+                print(f"Progress: {progress}% ({translated_count}/{total_to_translate})")
             
             # Save progress periodically
-            if translated_count > 0 and translated_count % save_interval == 0:
+            if translated_count % save_interval == 0 or translated_count == total_to_translate:
                 print(f"Saving progress after {translated_count} translations...")
                 save_progress(po, output_file)
         
+        if use_tqdm:
+            progress_bar.close()
+        
         # Save the final translated PO file
         save_progress(po, output_file, is_final=True)
-        print(f"Translation completed. Translated {translated_count} entries. Saved to {output_file}")
+        
+        # Save the translation cache
+        save_translation_cache()
+        
+        if interrupted:
+            print(f"Interrupted! Translated {translated_count}/{total_to_translate} entries before interruption.")
+            print(f"You can resume by running the script again with the -i flag to keep existing translations.")
+        else:
+            print(f"Translation completed. Translated {translated_count} entries. Saved to {output_file}")
         
     except Exception as e:
         print(f"Error: {e}")
@@ -409,6 +602,10 @@ def translate_po_file(input_file, output_file, batch_size=10, service=TRANSLATIO
                 print(f"Progress saved after error. You can resume with the -i flag.")
             except:
                 print("Failed to save progress after error.")
+        
+        # Save the translation cache
+        if 'translation_cache' in globals() and translation_cache:
+            save_translation_cache()
         
         sys.exit(1)
 
@@ -440,6 +637,10 @@ def main():
                         help="Save progress after this many translations (default: 50)")
     parser.add_argument("--list-languages", action="store_true",
                         help="List available languages and exit")
+    parser.add_argument("-w", "--workers", type=int, default=MAX_WORKERS,
+                        help=f"Number of worker threads for parallel translation (default: {MAX_WORKERS})")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable translation caching (not recommended)")
     
     args = parser.parse_args()
     
@@ -459,6 +660,12 @@ def main():
         base_name, ext = os.path.splitext(args.input_file)
         output_file = f"{base_name}.{args.target}{ext}"
     
+    # Disable caching if requested
+    if args.no_cache:
+        global translation_cache
+        translation_cache = None
+        print("Translation caching disabled")
+    
     translate_po_file(
         args.input_file, 
         output_file, 
@@ -467,7 +674,8 @@ def main():
         args.ignore_translated, 
         args.save_interval,
         args.target,
-        args.source
+        args.source,
+        args.workers
     )
 
 if __name__ == "__main__":
